@@ -206,7 +206,7 @@ class GoogleSitemapGeneratorStandardBuilder {
 	public function BuildArchives($gsg) {
 		global $wpdb, $wp_version;
 		$now = current_time('mysql');
-
+    $post_statuses = $this->BuildPostStatusesQuery();
 		//WP2.1 introduced post_status='future', for earlier WP versions we need to check the post_date_gmt
 		$arcresults = $wpdb->get_results("
 			SELECT DISTINCT
@@ -218,7 +218,7 @@ class GoogleSitemapGeneratorStandardBuilder {
 				$wpdb->posts
 			WHERE
 				post_date < '$now'
-				AND post_status = 'publish'
+				{$post_statuses}
 				AND post_type = 'post'
 				" . (floatval($wp_version) < 2.1
 				                                 ? "AND {$wpdb->posts}.post_date_gmt <= '" . gmdate('Y-m-d H:i:59') . "'"
@@ -268,7 +268,7 @@ class GoogleSitemapGeneratorStandardBuilder {
 									                                   : $p->post_date_gmt)), $gsg->GetOption("cf_home"), $gsg->GetOption("pr_home"));
 					}
 				} else {
-					$lm = get_lastpostmodified('GMT');
+					$lm = $this->GetLastPostModified();
 					$gsg->AddUrl(trailingslashit($home), ($lm ? $gsg->GetTimestampFromMySql($lm)
 								: time()), $gsg->GetOption("cf_home"), $gsg->GetOption("pr_home"));
 				}
@@ -276,7 +276,7 @@ class GoogleSitemapGeneratorStandardBuilder {
 		}
 
 		if($gsg->IsXslEnabled() && $gsg->GetOption("b_html") === true) {
-			$lm = get_lastpostmodified('GMT');
+			$lm = $this->GetLastPostModified();
 			$gsg->AddUrl($gsg->GetXmlUrl("", "", array("html" => true)), ($lm ? $gsg->GetTimestampFromMySql($lm)
 						: time()));
 		}
@@ -289,7 +289,7 @@ class GoogleSitemapGeneratorStandardBuilder {
 	 */
 	public function BuildAuthors($gsg) {
 		global $wpdb, $wp_version;
-
+    $post_statuses = $this->BuildPostStatusesQuery('p');
 		//Unfortunately there is no API function to get all authors, so we have to do it the dirty way...
 		//We retrieve only users with published and not password protected posts (and not pages)
 		$sql = "SELECT DISTINCT
@@ -301,7 +301,7 @@ class GoogleSitemapGeneratorStandardBuilder {
 					{$wpdb->posts} p
 				WHERE
 					p.post_author = u.ID
-					AND p.post_status = 'publish'
+					{$post_statuses}
 					AND p.post_type = 'post'
 					AND p.post_password = ''
 				GROUP BY
@@ -321,6 +321,7 @@ class GoogleSitemapGeneratorStandardBuilder {
 
 	public function FilterTermsQuery($selects, $args) {
 		global $wpdb;
+    $post_statuses = $this->BuildPostStatusesQuery('p');
 		$selects[] = "
 		( /* ADDED BY XML SITEMAPS */
 			SELECT
@@ -330,7 +331,7 @@ class GoogleSitemapGeneratorStandardBuilder {
 				{$wpdb->term_relationships} r
 			WHERE
 				p.ID = r.object_id
-				AND p.post_status = 'publish'
+				{$post_statuses}
 				AND p.post_password = ''
 				AND r.term_taxonomy_id = tt.term_taxonomy_id
 		) as _mod_date";
@@ -400,9 +401,11 @@ class GoogleSitemapGeneratorStandardBuilder {
 	}
 
 	public function BuildPostQuery($gsg, $postType) {
+    $post_statuses = "'" . implode( ", ", $this->GetCustomPostStatuses() ) . "'";//'publish, unreliable'
 		//Default Query Parameters
 		$qp = array(
 			'post_type' => $postType,
+			'post_status' => $post_statuses,
 			'numberposts' => 0,
 			'nopaging' => true,
 			'suppress_filters' => false
@@ -436,7 +439,7 @@ class GoogleSitemapGeneratorStandardBuilder {
 	public function Index($gsg) {
 		global $wpdb, $wp_version;
 
-		$blogUpdate = strtotime(get_lastpostdate('blog'));
+		$blogUpdate = strtotime($this->GetLastPostDate());
 
 		$gsg->AddSitemap("misc", null, $blogUpdate);
 
@@ -484,6 +487,87 @@ class GoogleSitemapGeneratorStandardBuilder {
 			remove_filter('posts_groupby', array($this, 'FilterIndexGroup'), 10, 2);
 		}
 	}
+
+	/**
+	 * Returns the list of custom post statuses. These are all visible post statuses
+	 *
+	 * @since 4.0b9
+	 * @return array Array of custom post statuses as per get_post_stati
+	 */
+	public function GetCustomPostStatuses() {
+		$post_statuses = get_post_stati( array('public' => true) );
+		return $post_statuses;
+	}
+
+
+	/**
+	 * Returns the list of public post statuses.
+	 *
+	 * @since 4.0b9
+	 * @return sql query of public post statuses
+	 */
+	public function BuildPostStatusesQuery($prefix = '') {
+    global $wpdb;
+    if(empty($prefix)) $prefix = $wpdb->posts;
+		$public_statuses = get_post_stati( array('public' => true) );
+		$where_statuses = " AND ($prefix.post_status = 'publish'";
+    foreach ( (array) $public_statuses as $status ) {
+      if ( 'publish' == $status ) continue;
+			$where_statuses .= " OR $prefix.post_status = '$status'";
+    }
+		$where_statuses .= ") ";
+		return $where_statuses;
+	}
+
+  public function GetLastPostDate() {
+    return $this->GetLastPostTime('blog', 'date');
+  }
+  
+  public function GetLastPostModified() {
+  	$lastpostmodified = $this->GetLastPostTime( 'GMT', 'modified' );
+  	$lastpostdate = $this->GetLastPostTime('blog', 'date');
+  	if ( $lastpostdate > $lastpostmodified )
+  		$lastpostmodified = $lastpostdate;
+
+    return $lastpostmodified;
+  }
+  
+  public function GetLastPostTime($timezone, $field) {
+  	global $wpdb;
+
+  	if ( !in_array( $field, array( 'date', 'modified' ) ) )
+  		return false;
+  	$timezone = strtolower( $timezone );
+  	$key = "lastpost{$field}:$timezone";
+  	$date = wp_cache_get( $key, 'timeinfo' );
+
+  	if ( !$date ) {
+  		$add_seconds_server = date('Z');
+  		$post_types = get_post_types( array( 'public' => true ) );
+  		array_walk( $post_types, array( &$wpdb, 'escape_by_ref' ) );
+  		$post_types = "'" . implode( "', '", $post_types ) . "'";
+      $post_statuses = "'" . implode( "', '", $this->GetCustomPostStatuses() ) . "'";
+
+  		switch ( $timezone ) {
+  			case 'gmt':
+  				$date = $wpdb->get_var("SELECT post_{$field}_gmt FROM $wpdb->posts WHERE post_status IN ({$post_statuses}) AND post_type IN ({$post_types}) ORDER BY post_{$field}_gmt DESC LIMIT 1");
+  				break;
+  			case 'blog':
+  				$date = $wpdb->get_var("SELECT post_{$field} FROM $wpdb->posts WHERE post_status IN ({$post_statuses}) AND post_type IN ({$post_types}) ORDER BY post_{$field}_gmt DESC LIMIT 1");
+  				break;
+  			case 'server':
+  				$date = $wpdb->get_var("SELECT DATE_ADD(post_{$field}_gmt, INTERVAL '$add_seconds_server' SECOND) FROM $wpdb->posts WHERE post_status IN ({$post_statuses}) AND post_type IN ({$post_types}) ORDER BY post_{$field}_gmt DESC LIMIT 1");
+  				break;
+  		}
+
+  		if ( $date )
+  			wp_cache_set( $key, $date, 'timeinfo' );
+  	}
+
+  	return $date;
+  }
+
 }
 
 if(defined("WPINC")) new GoogleSitemapGeneratorStandardBuilder();
+
